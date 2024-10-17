@@ -1,0 +1,11 @@
+kind: Service
+apiVersion: core/v1
+metadata:
+  name: dummy-chassis-app
+spec:
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+  selector:
+    app: dummy-chassis-app

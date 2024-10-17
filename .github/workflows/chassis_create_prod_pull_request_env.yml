@@ -1,0 +1,296 @@
+name: Create Pull Request Environment on Prod
+
+on:
+  pull_request:
+    types: [synchronize, opened, reopened, labeled]
+
+jobs:
+  detect_application_change:
+    runs-on: ubuntu-latest
+    if: |
+      ((github.event.action == 'labeled') && 
+        (github.event.label.name == 'Prod PR Env')) || 
+      (((github.event.action == 'opened') || (github.event.action == 'reopened') || (github.event.action == 'synchronize')) && 
+        contains(github.event.pull_request.labels.*.name, 'Prod PR Env'))
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      application_names: ${{ steps.chassisctl_pr_create_matrix.outputs.application_names }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Get changed files
+        id: get_changed_files
+        uses: tj-actions/changed-files@1754cd4b9e661d1f0eced3b33545a8d8b3bc46d8 # v44.5.0
+      - name: Install Chassisctl
+        uses: ./.github/composite/setup-chassisctl
+        with:
+          github_app_id: ${{ vars.RANDD_CHASSIS_APP_ID }}
+          github_app_private_key: ${{ secrets.RANDD_CHASSIS_PRIVATE_KEY }}
+          refs: main
+      - name: Generate github token for chassisctl
+        id: generate_token_chassisctl
+        uses: tibdex/github-app-token@3beb63f4bd073e61482598c45c71c1019b59b73a # v2.1.0
+        with:
+          app_id: ${{ vars.RANDD_CHASSIS_APP_ID }}
+          private_key: ${{ secrets.RANDD_CHASSIS_PRIVATE_KEY }}
+      - name: chassisctl tools create-matrix-json
+        id: chassisctl_pr_create_matrix
+        env:
+          GITHUB_TOKEN: ${{ steps.generate_token_chassisctl.outputs.token }}
+        run: |
+          application_names=`chassisctl tools create-matrix-json pr "${{ steps.get_changed_files.outputs.all_changed_files }}"`
+          echo "application_names=${application_names}" >> $GITHUB_OUTPUT
+  prod_build_image:
+    name: "[${{ matrix.application_name }}][prod] Build Image"
+    runs-on: ubuntu-latest
+    needs: detect_application_change
+    strategy:
+      fail-fast: false
+      matrix:
+        application_name: ${{ fromJson(needs.detect_application_change.outputs.application_names) }}
+    if: |
+      ((github.event.action == 'labeled') && 
+        (github.event.label.name == 'Prod PR Env')) || 
+      (((github.event.action == 'opened') || (github.event.action == 'reopened') || (github.event.action == 'synchronize')) && 
+        contains(github.event.pull_request.labels.*.name, 'Prod PR Env'))
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      image: ${{ steps.build_push_image.outputs.image }}
+      application_name: ${{ matrix.application_name }}
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Chassisctl
+        uses: ./.github/composite/setup-chassisctl
+        with:
+          github_app_id: ${{ vars.RANDD_CHASSIS_APP_ID }}
+          github_app_private_key: ${{ secrets.RANDD_CHASSIS_PRIVATE_KEY }}
+          refs: main
+      - name: Install yj
+        run: |
+          curl -sL https://github.com/sclevine/yj/releases/latest/download/yj-linux-amd64 -o yj
+          chmod +x yj
+          mv yj /usr/local/bin
+      - name: Get Application Name
+        run: |
+          target_application_name=`cat chassis_config.toml | yj -t | jq '.applications[0].name' | tr -d '"'`
+          target_application_directory=`cat chassis_config.toml | yj -t | jq '.applications[0].directory' | tr -d '"'`
+          echo "target_application_name=$target_application_name" >> $GITHUB_ENV
+          echo "target_application_directory=$target_application_directory" >> $GITHUB_ENV
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.CHASSIS_IAM_ARN }}
+          aws-region: ap-northeast-1
+      - name: Login to Amazon ECR Private
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build, tag, and push docker image to Amazon ECR
+        id: build_push_image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPOSITORY: chassis/pr-env
+          github_access_token: ${{ steps.generate_token.outputs.token }}
+        run: |
+          DOCKER_BUILDKIT=1 docker build --secret id=github_access_token -t $REGISTRY/$REPOSITORY:${{ env.target_application_name }}-${{ github.event.number }} .
+          image_digest=`docker push $REGISTRY/$REPOSITORY:${{ env.target_application_name }}-${{ github.event.number }} | grep -oP 'sha256:[a-fA-F0-9]{64}'`
+          echo "image=$REGISTRY/$REPOSITORY@$image_digest" >> $GITHUB_OUTPUT
+        working-directory: ${{ env.target_application_directory }}
+  prod_apply_pr_env:
+    name: "[${{ needs.prod_build_image.outputs.application_name }}][prod] Apply PR Environment"
+    runs-on: ubuntu-latest
+    needs: prod_build_image
+    if: needs.prod_build_image.outputs.image
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    environment: production
+    steps:
+      - name: Echo Image
+        run: |
+          echo ${{ needs.prod_build_image.outputs.image }}
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Chassisctl
+        uses: ./.github/composite/setup-chassisctl
+        with:
+          github_app_id: ${{ vars.RANDD_CHASSIS_APP_ID }}
+          github_app_private_key: ${{ secrets.RANDD_CHASSIS_PRIVATE_KEY }}
+          refs: main
+      - name: Generate github token for chassisctl
+        id: generate_token_chassisctl
+        uses: tibdex/github-app-token@3beb63f4bd073e61482598c45c71c1019b59b73a # v2.1.0
+        with:
+          app_id: ${{ vars.RANDD_CHASSIS_APP_ID }}
+          private_key: ${{ secrets.RANDD_CHASSIS_PRIVATE_KEY }}
+      - name: Insatll jq
+        uses: dcarbone/install-jq-action@8867ddb4788346d7c22b72ea2e2ffe4d514c7bcb # v2.1.0
+      - name: Install yj
+        run: |
+          curl -sL https://github.com/sclevine/yj/releases/latest/download/yj-linux-amd64 -o yj
+          chmod +x yj
+          mv yj /usr/local/bin
+      - name: Get Application Name
+        run: |
+          target_application_name=`cat chassis_config.toml | yj -t | jq '.applications[0].name' | tr -d '"'`
+          echo "target_application_name=$target_application_name" >> $GITHUB_ENV
+          target_application_namespace=`cat chassis_config.toml | yj -t | jq '.namespace' | tr -d '"'`
+          echo "target_application_namespace=$target_application_namespace" >> $GITHUB_ENV
+          target_application_directory=`cat chassis_config.toml | yj -t | jq '.applications[0].directory' | tr -d '"'`
+          echo "target_application_directory=$target_application_directory" >> $GITHUB_ENV
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+      - name: Install kustomize
+        uses: imranismail/setup-kustomize@2ba527d4d055ab63514ba50a99456fc35684947f # v2.1.0
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.CHASSIS_IAM_ARN }}
+          aws-region: ap-northeast-1
+      - name: Create kubeconfig file
+        run: aws eks update-kubeconfig --name ${{ vars.CHASSIS_CLUSTER_NAME }}
+      - name: Make PR Env kustomization.yaml
+        working-directory: ${{ env.target_application_directory }}
+        env:
+          GITHUB_TOKEN: ${{ steps.generate_token_chassisctl.outputs.token }}
+        run: |
+          chassisctl pr build --name=${{ env.target_application_name }} --namespace=${{ env.target_application_namespace }} --image=${{ needs.prod_build_image.outputs.image }} --pr_number=${{ github.event.number }} --environment=production
+      - name: Make schema.json for kustomize
+        working-directory: ${{ env.target_application_directory }}
+        run: |
+          kustomize openapi fetch > pr_env/schema.json
+          cat pr_env/schema.json | jq '."definitions"."prod.knative.serving.v1.Service"."properties"."spec"."properties"."template"."properties"."spec"."properties"."containers" |= .+ {"x-kubernetes-patch-merge-key": "name", "x-kubernetes-patch-strategy": "merge"}' > pr_env/changed_schema.json
+          mv pr_env/changed_schema.json pr_env/schema.json
+          cat pr_env/kustomization.yaml | yq -o=json | jq '. |= .+ {"openapi": {"path": "schema.json"}}' | yq -P > pr_env/changed_kustomization.yaml
+          mv pr_env/changed_kustomization.yaml pr_env/kustomization.yaml
+      - name: Apply PR Env
+        working-directory: ${{ env.target_application_directory }}
+        run: |
+          kubectl kustomize pr_env/.
+          kubectl apply -k pr_env/.
+      - name: Check Apply Completion
+        run: |
+          finish_apply=false
+          while [ $finish_apply == false ]; do
+            for status in $(kubectl get pods -n ${{ env.target_application_namespace }} | grep ${{ env.target_application_name }} | awk '{print $3}')
+              do
+                if [ $status == "Running" ]; then
+                  finish_apply=true
+                else
+                  sleep 10
+                fi
+              done
+          done
+      - name: Get Application URL on PR Env
+        id: get_application_url
+        env:
+          GITHUB_TOKEN: ${{ steps.generate_token_chassisctl.outputs.token }}
+        run: |
+          url=`chassisctl pr url --application-name ${{ env.target_application_name }} --environment production --pr-number ${{ github.event.number }}`
+          echo "url=$url" >> $GITHUB_OUTPUT
+      - name: Create Message
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment ${{ github.event.number }} --body "PR Environment: ${{ steps.get_application_url.outputs.url }}"
+  prod_run_pr_e2e_tests:
+    name: "[${{ needs.prod_build_image.outputs.application_name }}][prod] Run E2E Tests"
+    runs-on: ubuntu-latest
+    needs: [prod_build_image, prod_apply_pr_env]
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Chassisctl
+        uses: ./.github/composite/setup-chassisctl
+        with:
+          github_app_id: ${{ vars.RANDD_CHASSIS_APP_ID }}
+          github_app_private_key: ${{ secrets.RANDD_CHASSIS_PRIVATE_KEY }}
+          refs: main
+      - name: Generate github token for chassisctl
+        id: generate_token_chassisctl
+        uses: tibdex/github-app-token@3beb63f4bd073e61482598c45c71c1019b59b73a # v2.1.0
+        with:
+          app_id: ${{ vars.RANDD_CHASSIS_APP_ID }}
+          private_key: ${{ secrets.RANDD_CHASSIS_PRIVATE_KEY }}
+      - name: Insatll jq
+        uses: dcarbone/install-jq-action@8867ddb4788346d7c22b72ea2e2ffe4d514c7bcb # v2.1.0
+      - name: Install yj
+        run: |
+          curl -sL https://github.com/sclevine/yj/releases/latest/download/yj-linux-amd64 -o yj
+          chmod +x yj
+          mv yj /usr/local/bin
+      - name: Get Application Name
+        run: |
+          target_application_name=`cat chassis_config.toml | yj -t | jq '.applications[0].name' | tr -d '"'`
+          echo "target_application_name=$target_application_name" >> $GITHUB_ENV
+          target_application_namespace=`cat chassis_config.toml | yj -t | jq '.namespace' | tr -d '"'`
+          echo "target_application_namespace=$target_application_namespace" >> $GITHUB_ENV
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+      - name: Create Dockerfile for E2E Tests
+        run: chassisctl e2e build --mode=dockerfile --name=${{ env.target_application_name }}  --token=${{ steps.generate_token_chassisctl.outputs.token }}
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.CHASSIS_IAM_ARN }}
+          aws-region: ap-northeast-1
+      - name: Login to Amazon ECR Private
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build, tag, and Push E2E Test Docker Image to Amazon ECR
+        id: build_push_e2e_image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPOSITORY: chassis/pr-env
+          github_access_token: ${{ steps.generate_token.outputs.token }}
+        run: |
+          DOCKER_BUILDKIT=1 docker build --secret id=github_access_token -f ./pr_env/e2e/dockerfile/Dockerfile -t $REGISTRY/$REPOSITORY:e2e-pr-${{ env.target_application_name }}-${{ github.event.number }} .
+          e2e_image_digest=`docker push $REGISTRY/$REPOSITORY:e2e-pr-${{ env.target_application_name }}-${{ github.event.number }} | grep -oP 'sha256:[a-fA-F0-9]{64}'`
+          echo "e2e_image=$REGISTRY/$REPOSITORY@$e2e_image_digest" >> $GITHUB_OUTPUT
+      - name: Create E2E Job Manifest
+        id: create_e2e_job_manifest
+        env:
+          GITHUB_TOKEN: ${{ steps.generate_token_chassisctl.outputs.token }}
+        run: |
+          e2e_job_name=`chassisctl e2e build --mode=job --name=${{ env.target_application_name }} --namespace=${{ env.target_application_namespace }} --e2e_image=${{ steps.build_push_e2e_image.outputs.e2e_image }} --pr-number=${{ github.event.number }} | tail -n 1`
+          echo "e2e_job_name=$e2e_job_name" >> $GITHUB_OUTPUT
+      - name: Create kubeconfig file
+        run: aws eks update-kubeconfig --name ${{ vars.CHASSIS_CLUSTER_NAME }}
+      - name: Deploy Test Job to Kubernetes
+        run: |
+          kubectl apply -f ./pr_env/e2e/manifests/job.yaml
+      - name: Check Job Status
+        id: check_job_status
+        run: |
+          finish_e2e_test=false
+          while [ "$finish_e2e_test" == "false" ]; do
+            state_json=$(kubectl get pods --selector=job-name=${{ steps.create_e2e_job_manifest.outputs.e2e_job_name }} -n ${{ env.target_application_namespace }} -o jsonpath="{.items[*].status.containerStatuses[?(@.name=='${{ env.target_application_name }}')].state}")
+            reason=$(echo $state_json | jq -r '.terminated.reason')
+            if [ "$reason" == "Completed" ]; then
+              pod_name=$(kubectl get pods --selector=job-name=${{ steps.create_e2e_job_manifest.outputs.e2e_job_name }} -n ${{ env.target_application_namespace }} | awk 'NR>1 {print $1}')
+              echo "E2E Test is Completed :)"
+              echo $(kubectl logs $pod_name -n ${{ env.target_application_namespace }})
+              finish_e2e_test=true
+            elif [ "$reason" == "Error" ]; then
+              pod_name=$(kubectl get pods --selector=job-name=${{ steps.create_e2e_job_manifest.outputs.e2e_job_name }} -n ${{ env.target_application_namespace }} | awk 'NR>1 {print $1}')
+              echo "E2E Test is Failed :("
+              echo $(kubectl logs $pod_name -n ${{ env.target_application_namespace }})
+              echo "::error ::E2E test failed"
+              exit 1
+            else
+              echo "E2E Test is Running..."
+              sleep 10
+            fi
+          done

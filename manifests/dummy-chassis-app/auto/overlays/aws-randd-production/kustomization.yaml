@@ -1,0 +1,5 @@
+patches:
+  - path: gateway.yaml
+  - path: virtual_service.yaml
+resources:
+  - ../../../manual/base

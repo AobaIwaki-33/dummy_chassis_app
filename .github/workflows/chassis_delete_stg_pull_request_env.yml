@@ -1,0 +1,85 @@
+name: Delete Pull Request Environment on Stg
+
+on:
+  pull_request:
+    types: ["closed", "unlabeled"]
+
+jobs:
+  stg_delete_pr_env:
+    runs-on: ubuntu-latest
+    if: |
+      ((github.event.action == 'unlabeled') && 
+        (github.event.label.name == 'Stg PR Env')) || 
+      (github.event.action == 'closed')
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    environment: staging
+    steps:
+      - name: Echo Image
+        run: |
+          echo {{ needs.build_image.outputs.image }}
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install yj
+        run: |
+          curl -sL https://github.com/sclevine/yj/releases/latest/download/yj-linux-amd64 -o yj
+          chmod +x yj
+          mv yj /usr/local/bin
+      - name: Install Chassisctl
+        uses: ./.github/composite/setup-chassisctl
+        with:
+          github_app_id: ${{ vars.RANDD_CHASSIS_APP_ID }}
+          github_app_private_key: ${{ secrets.RANDD_CHASSIS_PRIVATE_KEY }}
+          refs: main
+      - name: Generate github token for chassisctl
+        id: generate_token_chassisctl
+        uses: tibdex/github-app-token@3beb63f4bd073e61482598c45c71c1019b59b73a # v2.1.0
+        with:
+          app_id: ${{ vars.RANDD_CHASSIS_APP_ID }}
+          private_key: ${{ secrets.RANDD_CHASSIS_PRIVATE_KEY }}
+      - name: Get Application Name
+        run: |
+          target_application_name=`cat chassis_config.toml | yj -t | jq '.applications[0].name' | tr -d '"'`
+          echo "target_application_name=$target_application_name" >> $GITHUB_ENV
+          target_application_namespace=`cat chassis_config.toml | yj -t | jq '.namespace' | tr -d '"'`
+          echo "target_application_namespace=$target_application_namespace" >> $GITHUB_ENV
+          target_application_directory=`cat chassis_config.toml | yj -t | jq '.applications[0].directory' | tr -d '"'`
+          echo "target_application_directory=$target_application_directory" >> $GITHUB_ENV
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+      - name: Install kustomize
+        uses: imranismail/setup-kustomize@2ba527d4d055ab63514ba50a99456fc35684947f # v2.1.0
+      - name: Make PR Env kustomization.yaml
+        working-directory: ${{ env.target_application_directory }}
+        env:
+          GITHUB_TOKEN: ${{ steps.generate_token_chassisctl.outputs.token }}
+        run: |
+          chassisctl pr build --name=${{ env.target_application_name }} --namespace=${{ env.target_application_namespace }} --image=dummy --pr_number=${{ github.event.number }} --environment=staging
+      - name: Get For E2E Test Job Name
+        id : get_e2e_job_name
+        env:
+          GITHUB_TOKEN: ${{ steps.generate_token_chassisctl.outputs.token }}
+        run: |
+          e2e_job_name=`chassisctl pr e2ejob --name=${{ env.target_application_name }} --namespace=${{ env.target_application_namespace }} --e2e_image=dummy --pr-number=${{ github.event.number }} | tail -n 1`
+          echo "e2e_job_name=$e2e_job_name" >> $GITHUB_OUTPUT
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.CHASSIS_IAM_ARN }}
+          aws-region: ap-northeast-1
+      - name: Create kubeconfig file
+        run: aws eks update-kubeconfig --name ${{ vars.CHASSIS_CLUSTER_NAME }}
+      - name: Delete PR Env
+        working-directory: ${{ env.target_application_directory }}
+        run: |
+          kubectl kustomize pr_env/.
+          kubectl delete -k pr_env/.
+      - name: Delete Job for E2E Test
+        run: |
+          kubectl delete jobs ${{ steps.get_e2e_job_name.outputs.e2e_job_name }} -n ${{ env.target_application_namespace }}
+      - name: Delete Comment from pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr comment ${{ github.event.number }} --edit-last --body "deleted"

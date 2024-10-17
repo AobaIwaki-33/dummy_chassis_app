@@ -1,0 +1,17 @@
+kind: Gateway
+apiVersion: networking/v1
+metadata:
+  name: dummy-chassis-app
+spec:
+  servers:
+    - port:
+        number: 80
+        protocol: HTTP
+        name: http
+      hosts:
+        - dummy-chassis-app.dummy.rd.ds.sansan.com
+        - dummy-chassis-app.blue.dummy.rd.ds.sansan.com
+        - dummy-chassis-app.green.dummy.rd.ds.sansan.com
+      name: http
+  selector:
+    istio: ingressgateway
