@@ -1,0 +1,30 @@
+fixed_version = "latest"
+repository_name = "eightcard/dummy_chassis_app"
+namespace = "samples"
+
+[[applications]]
+name = "dummy_chassis_app"
+directory = "."
+service_type = "deployment"
+environments = ["development", "staging", "production"]
+env = [{ name = "TARGET", value = "Chassis" }]
+include_entrusted_data = false
+use_istio_sidecar = false
+port = 8080
+
+[applications.pr]
+enabled = true
+environments = ["development", "staging", "production"]
+
+[applications.pr.used_resources]
+url_mode = "host"
+
+[applications.pr.used_resources.kservice]
+
+[applications.resources.limits]
+cpu = "100m"
+memory = "128Mi"
+
+[applications.resources.requests]
+cpu = "100m"
+memory = "128Mi"
