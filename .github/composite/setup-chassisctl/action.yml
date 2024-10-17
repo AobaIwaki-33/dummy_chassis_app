@@ -1,0 +1,38 @@
+name: "set up chassisctl"
+description: "Set up chassisctl"
+inputs:
+  github_app_id:
+    description: "The GitHub App ID"
+    required: true
+  github_app_private_key:
+    description: "The GitHub App private key"
+    required: true
+  refs:
+    default: "main"
+    description: "The branch to check out"
+runs:
+  using: "composite"
+  steps:
+    - name: Generate github token for chassisctl
+      id: generate_token_chassisctl
+      uses: tibdex/github-app-token@3beb63f4bd073e61482598c45c71c1019b59b73a # v2.1.0
+      with:
+        app_id: ${{ inputs.github_app_id }}
+        private_key: ${{ inputs.github_app_private_key }}
+    - name: Checkout randd_chassisctl with token and branch
+      uses: actions/checkout@v4
+      with:
+        repository: eightcard/randd_chassisctl
+        path: "randd_chassisctl"
+        token: ${{ steps.generate_token_chassisctl.outputs.token }}
+        ref: ${{ inputs.refs }}
+    - uses: sksat/setup-rye@789e590151fa5e781a3a60f156fc22d6787406e9 # after url update
+      with:
+        use-uv: "true"
+    - name: Install Chassisctl
+      shell: bash
+      working-directory: randd_chassisctl
+      run: rye install .
+    - name: Delete randd_chassisctl
+      shell: bash
+      run: rm -rf randd_chassisctl

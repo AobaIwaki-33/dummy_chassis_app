@@ -1,0 +1,105 @@
+name: docker build and push
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "manifests/**/auto/**"
+
+jobs:
+  detect_application_change:
+    runs-on: ubuntu-latest
+    outputs:
+      dockerfile_environments: ${{ steps.chassisctl_create_matrix.outputs.dockerfile_environments }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Get changed files
+        id: get_changed_files
+        uses: tj-actions/changed-files@1754cd4b9e661d1f0eced3b33545a8d8b3bc46d8 # v44.5.0
+      - name: Install Chassisctl
+        uses: ./.github/composite/setup-chassisctl
+        with:
+          github_app_id: ${{ vars.RANDD_CHASSIS_APP_ID }}
+          github_app_private_key: ${{ secrets.RANDD_CHASSIS_PRIVATE_KEY }}
+          refs: main
+      - name: chassisctl create-matrix
+        id: chassisctl_create_matrix
+        run: |
+          dockerfile_environments=`chassisctl tools create-matrix-json docker_build "${{ steps.get_changed_files.outputs.all_changed_files }}"`
+          echo "dockerfile_environments=${dockerfile_environments}"
+          echo "dockerfile_environments=${dockerfile_environments}" >> $GITHUB_OUTPUT
+  docker_build_push:
+    name: "[${{ matrix.dockerfile_environment.application_name }}][${{ matrix.dockerfile_environment.environment }}] Build and Push Docker Image"
+    runs-on: ubuntu-latest
+    needs: detect_application_change
+    environment: ${{ matrix.dockerfile_environment.environment }}
+    permissions:
+      id-token: write
+      contents: write
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        dockerfile_environment: ${{ fromJson(needs.detect_application_change.outputs.dockerfile_environments) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.CHASSIS_IAM_ARN }}
+          aws-region: ap-northeast-1
+      - name: Login to Amazon ECR Private
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Install Chassisctl
+        uses: ./.github/composite/setup-chassisctl
+        with:
+          github_app_id: ${{ vars.RANDD_CHASSIS_APP_ID }}
+          github_app_private_key: ${{ secrets.RANDD_CHASSIS_PRIVATE_KEY }}
+          refs: main
+      - name: Build, tag, and push docker image to Amazon ECR
+        id: build_push_image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPOSITORY: chassis/pr-env
+          github_access_token: ${{ steps.generate_token.outputs.token }}
+        run: |
+          DOCKER_BUILDKIT=1 docker build --secret id=github_access_token -t $REGISTRY/$REPOSITORY:${{ matrix.dockerfile_environment.application_name }} .
+          image_digest=`docker push $REGISTRY/$REPOSITORY:${{ matrix.dockerfile_environment.application_name }} | grep -oP 'sha256:[a-fA-F0-9]{64}'`
+          echo "image=$REGISTRY/$REPOSITORY@$image_digest" >> $GITHUB_OUTPUT
+        working-directory: ${{ matrix.dockerfile_environment.application_directory }}
+      - name: Install kustomize
+        uses: imranismail/setup-kustomize@2ba527d4d055ab63514ba50a99456fc35684947f # v2.1.0
+      - name: Generate github token for chassisctl
+        id: generate_token_chassisctl
+        uses: tibdex/github-app-token@3beb63f4bd073e61482598c45c71c1019b59b73a # v2.1.0
+        with:
+          app_id: ${{ vars.RANDD_CHASSIS_APP_ID }}
+          private_key: ${{ secrets.RANDD_CHASSIS_PRIVATE_KEY }}
+      - name: Get kustomization working directory
+        id: get_kustomization_working_directory
+        env:
+          GITHUB_TOKEN: ${{ steps.generate_token_chassisctl.outputs.token }}
+        run: |
+          kustomization_working_directory=`chassisctl tools get-path set-image-kustomization ${{ matrix.dockerfile_environment.application_name }} ${{ matrix.dockerfile_environment.environment }}`
+          echo "kustomization_working_directory=$kustomization_working_directory" >> $GITHUB_OUTPUT
+      - name: Add image to kustomization.yaml
+        working-directory: ${{ steps.get_kustomization_working_directory.outputs.kustomization_working_directory }}
+        run: |
+          kustomize edit set image ${{ matrix.dockerfile_environment.application_name_kabab }}=${{ steps.build_push_image.outputs.image }}
+      - name: Create new image digest PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git switch -c update-image-digest-${{ matrix.dockerfile_environment.application_name }}-${{ matrix.dockerfile_environment.environment }}
+          git config --global user.email "chassis-actions@sansan.com"
+          git config --global user.name "chassis-actions"
+          git add -A
+          git commit -m "Update image digest for ${{ matrix.dockerfile_environment.application_name }} in ${{ matrix.dockerfile_environment.environment }}"
+          git push origin HEAD
+          gh pr create \
+          --title "Update image digest for ${{ matrix.dockerfile_environment.application_name }} in ${{ matrix.dockerfile_environment.environment }}" \
+          --body "Update image digest for ${{ matrix.dockerfile_environment.application_name }} in ${{ matrix.dockerfile_environment.environment }}" \

@@ -1,0 +1,9 @@
+kind: VirtualService
+apiVersion: networking/v1
+metadata:
+  name: dummy-chassis-app
+spec:
+  hosts:
+    - dummy-chassis-app.dev.rd.ds.sansan.com
+    - dummy-chassis-app.blue.dev.rd.ds.sansan.com
+    - dummy-chassis-app.green.dev.rd.ds.sansan.com

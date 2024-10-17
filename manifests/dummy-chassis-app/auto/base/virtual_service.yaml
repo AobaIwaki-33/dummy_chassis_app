@@ -1,0 +1,18 @@
+kind: VirtualService
+apiVersion: networking/v1
+metadata:
+  name: dummy-chassis-app
+spec:
+  hosts:
+    - dummy-chassis-app.dummy.rd.ds.sansan.com
+    - dummy-chassis-app.blue.dummy.rd.ds.sansan.com
+    - dummy-chassis-app.green.dummy.rd.ds.sansan.com
+  http:
+    - match:
+        - uri:
+            prefix: /
+      route:
+        - destination:
+            host: dummy-chassis-app
+            port:
+              number: 80
