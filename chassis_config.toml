@@ -1,4 +1,4 @@
-fixed_version = "latest"
+fixed_version = "latest" # 使用するChasis Version
 repository_name = "eightcard/dummy_chassis_app"
 namespace = "samples"
 
